@@ -13,11 +13,6 @@
 #include <string>
 #include <thread>
 
-namespace fs = std::filesystem;
-using namespace std;
-
-#define BUFFER_SIZE 4096
-
 const string SERVER_ROOT = "server/";
 const string USERS_FILE = SERVER_ROOT + "users.txt";
 const string BASE_DIR = SERVER_ROOT + "users/"; // users/<username>/

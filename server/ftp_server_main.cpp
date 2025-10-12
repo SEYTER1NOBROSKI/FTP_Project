@@ -13,8 +13,6 @@
 #include <string>
 #include <thread>
 
-namespace fs = std::filesystem;
-
 int main(int argc, char *argv[]) {
     int port = 2121;
     if (argc >= 2) port = stoi(argv[1]);

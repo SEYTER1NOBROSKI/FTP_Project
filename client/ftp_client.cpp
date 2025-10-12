@@ -9,11 +9,6 @@
 #include <sstream>
 #include <string>
 
-namespace fs = std::filesystem;
-using namespace std;
-
-#define BUFFER_SIZE 4096
-
 // send all
 bool send_all(int sock, const char *data, size_t len) {
     size_t sent = 0;
