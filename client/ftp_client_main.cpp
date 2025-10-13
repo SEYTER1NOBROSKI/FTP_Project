@@ -56,6 +56,16 @@ int main(int argc, char *argv[]) {
             do_GET_common(sock, "GETALL", f);
         } else if (cmd == "LIST" || cmd == "LISTALL" || cmd == "HELP") {
             do_LIST_like(sock, cmd);
+        } else if (cmd == "PWD" || cmd == "DELETE" || cmd == "MKDIR" || cmd == "CD") {
+            send_line(sock, line);
+            string resp;
+            char buf[1024];
+            ssize_t r = recv(sock, buf, sizeof(buf)-1, 0);
+            if (r > 0) {
+                buf[r] = 0;
+                resp = buf;
+            }
+            if (resp.empty()) cout << "No response from server\n"; else cout << resp;
         } else if (cmd == "REGISTER" || cmd == "LOGIN") {
             // send as-is and print single-line response or size-prefixed response
             send_line(sock, line);

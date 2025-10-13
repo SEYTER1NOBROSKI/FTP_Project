@@ -1,4 +1,5 @@
 #include "ftp_server.h"
+#include "picosha2.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -12,12 +13,38 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <random>
 
 const string SERVER_ROOT = "server/";
 const string USERS_FILE = SERVER_ROOT + "users.txt";
 const string BASE_DIR = SERVER_ROOT + "users/"; // users/<username>/
 
 mutex usersMutex;
+
+void list_directory_recursive(const fs::path& path, const string& prefix, string& result) {
+    for (const auto& entry : fs::directory_iterator(path)) {
+        string entryName = entry.path().filename().string();
+        if (fs::is_directory(entry.path())) {
+            result += prefix + entryName + "/\n";
+            list_directory_recursive(entry.path(), prefix + entryName + "/", result);
+        } else if (fs::is_regular_file(entry.path())) {
+            result += prefix + entryName + "\n";
+        }
+    }
+}
+
+string generate_salt(size_t length) {
+    const std::string characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::random_device random_device;
+    std::mt19937 generator(random_device());
+    std::uniform_int_distribution<> distribution(0, characters.size() - 1);
+
+    std::string salt;
+    for (size_t i = 0; i < length; ++i) {
+        salt += characters[distribution(generator)];
+    }
+    return salt;
+}
 
 // helper: ensure directory exists
 void ensureDir(const string &p) {
@@ -96,28 +123,41 @@ void sendTextBlock(int clientSock, const string &text) {
 // users file operations
 bool registerUser(const string &username, const string &password) {
     lock_guard<mutex> lock(usersMutex);
-    // read existing
-    ifstream in(USERS_FILE);
-    string u, p;
-    while (in >> u >> p) {
-        if (u == username) return false;
+
+    ifstream in_check(USERS_FILE);
+    string u, s, h;
+    while (in_check >> u >> s >> h) {
+        if (u == username) {
+            return false;
+        }
     }
-    in.close();
+    in_check.close();
+
+    string salt = generate_salt(16);
+    string pass_with_salt = password + salt;
+    string hashed_password = picosha2::hash256_hex_string(pass_with_salt);
+
     ofstream out(USERS_FILE, ios::app);
-    out << username << " " << password << "\n";
+    out << username << " " << salt << " " << hashed_password << "\n";
     out.close();
 
     ensureDir(BASE_DIR + username);
-    cout << "[LOG] Registered user and created dir: " << BASE_DIR + username << endl;
+    cout << "[LOG] Registered user: " << username << endl;
     return true;
 }
 
 bool checkUser(const string &username, const string &password) {
     lock_guard<mutex> lock(usersMutex);
     ifstream in(USERS_FILE);
-    string u, p;
-    while (in >> u >> p) {
-        if (u == username && p == password) return true;
+
+    string u, stored_salt, stored_hash;
+    while (in >> u >> stored_salt >> stored_hash) {
+        if (u == username) {
+            string pass_with_salt = password + stored_salt;
+            string hashed_attempt = picosha2::hash256_hex_string(pass_with_salt);
+            
+            return hashed_attempt == stored_hash;
+        }
     }
     return false;
 }
@@ -125,6 +165,8 @@ bool checkUser(const string &username, const string &password) {
 void handleClient(int clientSock) {
     string username;
     bool authenticated = false;
+    string userHomeDir;
+    string currentPath;
 
     while (true) {
         string line = recv_line(clientSock);
@@ -161,6 +203,9 @@ void handleClient(int clientSock) {
             if (checkUser(u, p)) {
                 username = u;
                 authenticated = true;
+                userHomeDir = fs::path(BASE_DIR + username).lexically_normal().string();
+                currentPath = userHomeDir;
+                ensureDir(currentPath);
                 string msg = "LOGGED IN\n";
                 send_all(clientSock, msg.c_str(), msg.size());
                 cout << "[LOG] User logged in: " << username << endl;
@@ -173,11 +218,15 @@ void handleClient(int clientSock) {
                 "Available commands:\n"
                 "REGISTER <username> <password>\n"
                 "LOGIN <username> <password>\n"
-                "PUT <filename>\n"
-                "GET <filename>\n"
-                "LIST\n"
-                "LISTALL\n"
-                "GETALL <username>/<filename>\n"
+                "PUT <local_path>          (Upload file to current dir)\n"
+                "GET <filename>            (Download file from current dir)\n"
+                "LIST                      (List files in current dir)\n"
+                "PWD                       (Show current server directory)\n"
+                "CD <dirname>              (Change server directory)\n"
+                "MKDIR <dirname>           (Create directory)\n"
+                "DELETE <filename>         (Delete file)\n"
+                "LISTALL                   (List all files from all users)\n"
+                "GETALL <user/file>        (Download any user's file)\n"
                 "HELP\n"
                 "EXIT\n";
             sendTextBlock(clientSock, helpTxt);
@@ -187,16 +236,9 @@ void handleClient(int clientSock) {
                 send_all(clientSock, msg.c_str(), msg.size());
                 continue;
             }
-            string list;
-            string dir = BASE_DIR + username;
-            if (fs::exists(dir)) {
-                list = "Files:\n";
-                for (auto &e : fs::directory_iterator(dir)) {
-                    if (fs::is_regular_file(e.path()))
-                        list += e.path().filename().string() + "\n";
-                }
-            } else {
-                list = "Files:\n";
+            string list = "Files in current directory:\n";
+            if (fs::exists(currentPath)) {
+                list_directory_recursive(currentPath, "", list);
             }
             sendTextBlock(clientSock, list);
         } else if (cmd == "LISTALL") {
@@ -210,10 +252,7 @@ void handleClient(int clientSock) {
                 for (auto &u : fs::directory_iterator(BASE_DIR)) {
                     if (fs::is_directory(u.path())) {
                         string uname = u.path().filename().string();
-                        for (auto &f : fs::directory_iterator(u.path())) {
-                            if (fs::is_regular_file(f.path()))
-                                list += uname + "/" + f.path().filename().string() + "\n";
-                        }
+                        list_directory_recursive(u.path(), uname + "/", list);
                     }
                 }
             }
@@ -257,10 +296,9 @@ void handleClient(int clientSock) {
             string ok = "OK\n";
             send_all(clientSock, ok.c_str(), ok.size());
 
-            // write exact fsize bytes to file
             string cleanName = fs::path(filename).filename().string();
-            string savePath = BASE_DIR + username + "/" + cleanName;
-            ensureDir(BASE_DIR + username);
+            string savePath = currentPath + "/" + cleanName;
+
             ofstream out(savePath, ios::binary);
             if (!out.is_open()) {
                 string msg = "ERROR: Cannot create file\n";
@@ -297,7 +335,7 @@ void handleClient(int clientSock) {
                 continue;
             }
             string cleanName = fs::path(filename).filename().string();
-            string path = BASE_DIR + username + "/" + cleanName;
+            string path = currentPath + "/" + cleanName;
             cout << "[LOG] GET request by " << username << " for " << path << endl;
             sendFileToClient(clientSock, path);
         } else if (cmd == "GETALL") {
@@ -318,6 +356,111 @@ void handleClient(int clientSock) {
             string path = BASE_DIR + rem;
             cout << "[LOG] GETALL request by " << username << " for " << path << endl;
             sendFileToClient(clientSock, path);
+        } else if (cmd == "PWD") {
+            if (!authenticated) {
+                string msg = "ERROR: Not logged in\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+            
+            string relativePath = "/";
+            if (currentPath.length() > userHomeDir.length()) {
+                relativePath += currentPath.substr(userHomeDir.length() + 1);
+            }
+            string msg = "OK\n" + relativePath + "\n";
+            send_all(clientSock, msg.c_str(), msg.size());
+        } else if (cmd == "MKDIR") {
+                        if (!authenticated) {
+                string msg = "ERROR: Not logged in\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+            string dirname;
+            iss >> dirname;
+            if (dirname.empty()) {
+                string msg = "ERROR: No directory name specified\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+
+            fs::path newDir = fs::path(currentPath) / dirname;
+            string newDirStr = newDir.lexically_normal().string();
+
+            if (newDirStr.rfind(userHomeDir, 0) != 0) {
+                 string msg = "ERROR: Permission denied\n";
+                 send_all(clientSock, msg.c_str(), msg.size());
+                 continue;
+            }
+
+            if (fs::create_directory(newDir)) {
+                string msg = "OK\nDirectory created\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            } else {
+                string msg = "ERROR: Could not create directory\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            }
+        } else if (cmd == "DELETE") {
+            if (!authenticated) {
+                string msg = "ERROR: Not logged in\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+            string filename;
+            iss >> filename;
+            if (filename.empty()) {
+                string msg = "ERROR: No filename specified\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+            
+            fs::path fileToDelete = fs::path(currentPath) / filename;
+            string fileStr = fileToDelete.lexically_normal().string();
+
+            if (fileStr.rfind(userHomeDir, 0) != 0) {
+                 string msg = "ERROR: Permission denied\n";
+                 send_all(clientSock, msg.c_str(), msg.size());
+                 continue;
+            }
+
+            if (fs::is_regular_file(fileToDelete) && fs::remove(fileToDelete)) {
+                string msg = "OK\nFile deleted\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            } else {
+                string msg = "ERROR: File not found or could not be deleted\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            }
+        } else if (cmd == "CD") {
+            if (!authenticated) {
+                string msg = "ERROR: Not logged in\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+            string dirname;
+            iss >> dirname;
+            if (dirname.empty()) {
+                string msg = "ERROR: No directory specified\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+                continue;
+            }
+
+            fs::path newPath = fs::path(currentPath) / dirname;
+            newPath = newPath.lexically_normal();
+            string newPathStr = newPath.string();
+
+            if (newPathStr.rfind(userHomeDir, 0) != 0) {
+                 string msg = "ERROR: Permission denied\n";
+                 send_all(clientSock, msg.c_str(), msg.size());
+                 continue;
+            }
+
+            if (fs::exists(newPath) && fs::is_directory(newPath)) {
+                currentPath = newPathStr;
+                string msg = "OK\nDirectory changed\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            } else {
+                string msg = "ERROR: Directory not found\n";
+                send_all(clientSock, msg.c_str(), msg.size());
+            }
         } else if (cmd == "EXIT") {
             break;
         } else {

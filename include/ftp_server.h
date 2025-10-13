@@ -2,7 +2,7 @@
 
 #include <string>
 #include <mutex>
-
+#include <filesystem>
 
 extern const std::string SERVER_ROOT;
 extern const std::string USERS_FILE;
@@ -13,6 +13,10 @@ namespace fs = std::filesystem;
 using namespace std;
 
 #define BUFFER_SIZE 4096
+
+void list_directory_recursive(const fs::path& path, const string& prefix, string& result);
+
+string generate_salt(size_t length);
 
 void ensureDir(const std::string &p);
 
